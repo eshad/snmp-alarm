@@ -1,0 +1,118 @@
+#!/bin/bash
+
+# SNMP server and community configuration
+SNMP_SERVER="localhost" 
+SNMP_COMMUNITY="public" 
+
+# MySQL credentials
+DB_HOST="3.0.52.254" 
+DB_NAME="rts_db" 
+DB_USER="root" 
+DB_PASS="AmirF430!@#$" 
+
+# Log file setup
+LOG_FILE="$(dirname "$0")/monitoring_log.json" 
+
+# Define the list of OIDs to query and their server names
+declare -A OID_NAME_MAP
+
+
+### Dynamically get the IP from DB then map
+
+# Base OID prefix (you can adjust this if the base changes)
+BASE_OID=".1.3.6.1.4.1.33744.2.1.4"
+
+# Fetch list of names and IPs from DB
+readarray -t DB_ROWS < <(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -se \
+  "SELECT name, host_ipaddress FROM healthcheck_items ORDER BY id;")
+
+# Loop and map each entry to a generated OID
+INDEX=1
+for row in "${DB_ROWS[@]}"; do
+  NAME=$(echo "$row" | awk '{print $1}')
+  IP=$(echo "$row" | awk '{print $2}')
+  OID_NAME_MAP["$BASE_OID.$INDEX"]="$NAME"
+  ((INDEX++))
+done
+
+########## End of dynamic IP 
+
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.1"]="3.0.52.254" 
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.2"]="svr-rts-02" 
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.3"]="vipet-01" 
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.4"]="wks-01" 
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.5"]="vipet-02" 
+#OID_NAME_MAP[".1.3.6.1.4.1.33744.2.1.4.6"]="tes-pids" 
+
+# Function to query SNMP and handle database updates
+query_and_update_db() {
+  local oid=$1
+  local name=$2
+
+  # Query the SNMP server for the OID
+  RESPONSE=$(snmpget -v2c -c "$SNMP_COMMUNITY" -r 3 -t 10 -m '' "$SNMP_SERVER" "$oid" 2>/dev/null)
+
+  if [[ -n "$RESPONSE" ]]; then
+    VALUE=$(echo "$RESPONSE" | awk -F: '{print $NF}' | xargs)
+
+    if [[ "$VALUE" == "0" ]]; then
+      # Server is online, do nothing
+      echo "Server $name is online (SNMP response = 0). No action needed." 
+
+    elif [[ "$VALUE" == "1" ]]; then
+      # Server is offline, check database
+      echo "Server $name is offline (SNMP response = 1)." 
+
+      # Check for existing active alarms
+      EXISTING_HISTORY=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -se \
+        "SELECT history FROM alarm WHERE name='$name' AND status='Active' ORDER BY createdOn DESC LIMIT 1;")
+
+      if [[ -z "$EXISTING_HISTORY" ]]; then
+        # No alarm exists, create a new one
+        INSERT_QUERY="INSERT INTO alarm (status, createdOn, createdBy, name, type, description, severity, history, module) VALUES 
+          ('Active', NOW(), 0, '$name', '$name', 'Offline', 3, 0, 0);" 
+        echo "Executing SQL: $INSERT_QUERY" 
+        mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -se "$INSERT_QUERY" 
+
+        LOG_ENTRY="$(date +%Y-%m-%dT%H:%M:%S) | {\"status\":\"Active\",\"createdOn\":\"$(date +%Y-%m-%dT%H:%M:%S)\",\"createdBy\":0,\"name\":\"$name\",\"type\":\"$name\",\"description\":\"Offline\",\"severity\":3,\"history\":0,\"module\":0}" 
+        sudo bash -c "echo \"$LOG_ENTRY\" >> \"$LOG_FILE\"" 
+        echo "New alarm inserted for $name (offline, history=0)." 
+
+      elif [[ "$EXISTING_HISTORY" == "1" ]]; then
+        # An alarm with history=1 exists, create a new alarm with history=0
+        INSERT_QUERY="INSERT INTO alarm (status, createdOn, createdBy, name, type, description, severity, history, module) VALUES 
+          ('Active', NOW(), 0, '$name', '$name', 'Offline', 3, 0, 0);" 
+        echo "Executing SQL: $INSERT_QUERY" 
+        mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -se "$INSERT_QUERY" 
+
+        LOG_ENTRY="$(date +%Y-%m-%dT%H:%M:%S) | {\"status\":\"Active\",\"createdOn\":\"$(date +%Y-%m-%dT%H:%M:%S)\",\"createdBy\":0,\"name\":\"$name\",\"type\":\"$name\",\"description\":\"Offline\",\"severity\":3,\"history\":0,\"module\":0}" 
+        sudo bash -c "echo \"$LOG_ENTRY\" >> \"$LOG_FILE\"" 
+        echo "New alarm inserted for $name (offline, history=0)." 
+
+        # Send WebSocket message
+        wscat -c ws://10.147.84.13:9001 -x '{"commandStr":"Alarm","action":"refresh"}'
+        echo "WebSocket message sent for $name." 
+
+      else
+        # An alarm with history=0 already exists, do nothing
+        echo "Alarm already exists for $name with history=0. No action needed." 
+      fi
+
+    else
+      echo "Unexpected SNMP value for $name: $VALUE" 
+    fi
+  else
+    echo "No response for OID $oid. The SNMP server may be unreachable." 
+  fi
+}
+
+# Main monitoring loop
+while true; do
+  echo "Checking SNMP statuses..." 
+  for oid in "${!OID_NAME_MAP[@]}"; do
+    query_and_update_db "$oid" "${OID_NAME_MAP[$oid]}" 
+  done
+
+  # Wait for a specified interval before the next check
+  sleep 5 # Adjust the interval as needed
+done
